@@ -129,7 +129,8 @@ const REGEX = {
         JAVA: {
             MAIN: /Running Java (\d+) \(([^)]+)\)/m,
             FALLBACK1: /java version ([^\s]+) /m,
-            FALLBACK2: /Java Version: ([^\r\n]*)/m
+            FALLBACK2: /Java Version: ([^\r\n]*)/m,
+            FALLBACK3: /Java: ([^\s]+),/m
         }
     }
 };
@@ -150,7 +151,8 @@ const ERROR_PATTERNS = [
         })
     },
     {
-        pattern: /could not load '([^']+)' in folder '([^']+)'/i,
+        //Could not load plugin 'ShulkrCompanion-1.0-SNAPSHOT-all.jar' in folder 'plugins'
+        pattern: /Could not load plugin '([^']+)' in folder '([^']+)'/i,
         type: 'plugin_load_failure',
         getSuggestion: (matches) => ({
             title: 'Plugin Load Failure',
@@ -159,6 +161,20 @@ const ERROR_PATTERNS = [
                 'Verify the plugin file is not corrupted',
                 'Check if all required dependencies are installed',
                 'Ensure the plugin is compatible with your server version'
+            ]
+        })
+    },
+    {
+        pattern: /Unsupported API version ([^\s]+)/i,
+        type: 'api_version',
+        getSuggestion: (matches) => ({
+            title: 'Unsupported API Version',
+            description: `Unsupported API version ${matches[1]}`,
+            solutions: [
+                'Update the plugin to a version compatible with your server',
+                'Update the server software to a version compatible with the plugin',
+                'Check if there\'s a legacy version of the plugin for your server version',
+                'Contact the plugin developer for support'
             ]
         })
     },
@@ -368,13 +384,12 @@ const ERROR_PATTERNS = [
 
 // Optimized server software detection patterns
 const SERVER_PATTERNS = {
-    PURPUR: /(?:Loading|running) Purpur ([^\s]+) \(([^)]+)\)/mi,
+    PURPUR: /(?:Purpur|Purpur-Server) version git-Purpur-([^\s]+)/mi,
     PAPER: /(?:Paper|Paper-Server) version git-Paper-([^\s]+)/mi,
     FOLIA: /(?:Folia|Folia-Server) version git-Folia-([^\s]+)/mi,
     SPIGOT: /This server is running (?:CraftBukkit|Spigot) version ([^\s]+)/mi,
     FABRIC: /Fabric Loader ([^\s]+)/mi,
-    FORGE: /(?:Forge Mod Loader version|MinecraftForge v)([^\s]+)/mi,
-    VANILLA: /Starting minecraft server version ([^\s]+)/mi
+    FORGE: /(?:Forge Mod Loader version|MinecraftForge v)([^\s]+)/mi
 };
 
 // Cache log formatting patterns
@@ -562,7 +577,8 @@ function parseServerInfo(content) {
     const javaMatch =
         content.match(REGEX.SERVER_INFO.JAVA.MAIN) ||
         content.match(REGEX.SERVER_INFO.JAVA.FALLBACK1) ||
-        content.match(REGEX.SERVER_INFO.JAVA.FALLBACK2);
+        content.match(REGEX.SERVER_INFO.JAVA.FALLBACK2) ||
+        content.match(REGEX.SERVER_INFO.JAVA.FALLBACK3);
 
     if (javaMatch) {
         info.java.version = javaMatch[1];
@@ -570,9 +586,14 @@ function parseServerInfo(content) {
     }
 
     // Server Software Detection
-    const serverMatches = Object.entries(SERVER_PATTERNS)
+    let serverMatches = Object.entries(SERVER_PATTERNS)
         .map(([type, pattern]) => ({ type, match: content.match(pattern) }))
         .find(({ match }) => match);
+
+    serverMatches = serverMatches || { type: 'VANILLA', match: content.match(/Starting minecraft server version ([^\s]+)/mi) };
+    if (!serverMatches.match) {
+        serverMatches = { type: 'UNKNOWN', match: ['Unknown', ''] };
+    }
 
     if (serverMatches) {
         const { type, match } = serverMatches;
@@ -583,7 +604,8 @@ function parseServerInfo(content) {
             SPIGOT: { name: 'Spigot', icon: '🔌' },
             FABRIC: { name: 'Fabric', icon: '🧵' },
             FORGE: { name: 'Forge', icon: '⚒️' },
-            VANILLA: { name: 'Vanilla', icon: '📦' }
+            VANILLA: { name: 'Vanilla', icon: '📦' },
+            UNKNOWN: { name: 'Unknown', icon: '❓' }
         };
 
         const software = softwareMap[type];
@@ -607,15 +629,26 @@ async function handleRequest(request) {
         });
     }
 
-    if (path.startsWith('/api/logs')) {
+    if (path.startsWith('/api/logs') || path.startsWith('/api/1/log')) { // '/api/1/log' are for compatibility with mclo.gs plugin/mod
         if (request.method === 'POST') {
-            const content = await request.text();
+
+            const reqformdata = request.headers.get('Content-Type')?.includes('application/x-www-form-urlencoded') ? await request.formData() : null;
+
+            console.log(reqformdata);
+
+            let content = reqformdata?.get('content') || await request.text();
+
+            console.log(content);
             if (!content) {
                 return new Response(
                     JSON.stringify({ success: false, error: 'No content provided' }),
                     { headers: { 'Content-Type': 'application/json' } }
                 );
             }
+
+            if (content.length > 11 * 1024 * 1024) {
+                content = content.substring(0, 11 * 1024 * 1024) + '\n\n[Content shortened due to size]';
+            }            
 
             const id = generateId();
             await LOGS_KV.put(id, parseMinecraftLog(content), {
@@ -624,9 +657,10 @@ async function handleRequest(request) {
 
             return new Response(
                 JSON.stringify({
-                    success: true,
-                    id,
-                    url: `${url.origin}/logs/${id}`
+                    "success": true,
+                    "id": id,
+                    "url": `${url.origin}/logs/${id}`,
+                    "raw": `${url.origin}/logs/${id}?raw`
                 }),
                 { headers: { 'Content-Type': 'application/json' } }
             );
@@ -675,7 +709,7 @@ async function handleRequest(request) {
 
         //line numbers
         formattedContent = formattedContent.split('<br>').map((line, index) => {
-            return `<span class="text-gray-500 font-mono"><a name="L${index + 1}">${index + 1}</a></span> ${line}`;
+            return `<span class="text-gray-500 font-mono select-none"><a name="L${index + 1}" href="#L${index + 1}">${index + 1}</a></span> ${line}`;
         }).join('<br>');
 
         //modID (e.g. ModID: modid,)
@@ -714,8 +748,7 @@ async function handleRequest(request) {
                     </div>
                     ${generateInfoHeader(serverInfo)}
                     ${errors.length > 0 ? generateErrorSuggestions(errors) : ''}
-                    <div class="bg-white rounded-b-lg shadow-md p-6 font-mono whitespace-pre-wrap dark:bg-gray-700 dark:text-gray-100">${formattedContent}
-                    </div>
+                    <div class="bg-white rounded-b-lg shadow-md p-6 font-mono whitespace-pre-wrap dark:bg-gray-700 dark:text-gray-100">${formattedContent}</div>
                 </div>
             </body>
             <script>
